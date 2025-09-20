@@ -39,10 +39,23 @@ FLASK_APP=app.py flask run -h 0.0.0.0 -p 5000
 
 @@ make argocd pull from privet castum repo
 
+###########################################
+
+sudo nano /etc/docker/daemon.json
+
+{
+  "insecure-registries" : ["192.168.68.64:5000"]
+}
+
+sudo systemctl restart docker
+
+###########################################
 
 containers:
 - name: minihub
 image: 192.168.68.64:5000/minihub:amd64_latest
+
+###########################################
 
 kubectl create secret docker-registry regcred \
   --docker-server=192.168.68.64:5000 \
@@ -50,6 +63,8 @@ kubectl create secret docker-registry regcred \
   --docker-password='Admin123' \
   --docker-email='its_a_vio@hotmail.com' \
   -n argocd
+
+###########################################
 
 sudo mkdir -p /etc/rancher/k3s
 
@@ -71,3 +86,5 @@ mirrors:
 EOF
 
 sudo systemctl restart k3s
+
+###########################################

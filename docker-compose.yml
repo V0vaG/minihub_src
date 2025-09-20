@@ -1,0 +1,19 @@
+version: "3.8"
+services:
+  app:
+    build: ./app
+    image: registry-minihub-app:local
+    env_file:
+      - ./app/env
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  nginx:
+    build: ./nginx
+    image: registry-minihub-nginx:local
+    depends_on:
+      - app
+    ports:
+      - "8088:80"
+    restart: unless-stopped

@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+{% block body %}
+  {% if repos|length == 0 %}
+    <div class="alert alert-warning">No repositories found.</div>
+  {% endif %}
+  <div class="row g-3">
+  {% for repo in repos %}
+    <div class="col-12 col-md-6 col-lg-4">
+      <div class="card repo-card">
+        <div class="card-body">
+          <h5 class="card-title"><a href="{{ url_for('repo_detail', name=repo) }}" class="text-decoration-none">{{ repo }}</a></h5>
+          <p class="card-text small text-muted mb-1">{{ tag_counts.get(repo, 0) }} tag{{ '' if tag_counts.get(repo, 0)==1 else 's' }}</p>
+          <div class="d-flex gap-2">
+            <a href="{{ url_for('repo_detail', name=repo) }}" class="btn btn-sm btn-outline-primary">View tags</a>
+            {% if enable_delete %}
+              <form method="post" action="{{ url_for('delete_repo', name=repo) }}" onsubmit="return confirm('Delete ENTIRE repository {{ repo }}? This removes all tags (space is reclaimed only after GC).');">
+                {% if admin_token_required %}
+                <input type="hidden" name="token" value="{{ admin_token }}">
+                {% endif %}
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete repo</button>
+              </form>
+            {% endif %}
+
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+
+  {% if pages > 1 %}
+  <nav class="mt-4" aria-label="Repo pagination">
+    <ul class="pagination">
+      <li class="page-item {% if page<=1 %}disabled{% endif %}"><a class="page-link" href="{{ url_for('home', q=q, page=page-1) }}">Previous</a></li>
+      {% for p in range(1, pages+1) %}
+        <li class="page-item {% if p==page %}active{% endif %}"><a class="page-link" href="{{ url_for('home', q=q, page=p) }}">{{ p }}</a></li>
+      {% endfor %}
+      <li class="page-item {% if page>=pages %}disabled{% endif %}"><a class="page-link" href="{{ url_for('home', q=q, page=page+1) }}">Next</a></li>
+    </ul>
+  </nav>
+  {% endif %}
+{% endblock %}

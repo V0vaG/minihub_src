@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block body %}
+  <div class="mb-3 d-flex align-items-center gap-3">
+    <a href="{{ url_for('home') }}" class="text-decoration-none">← Back</a>
+    <h2 class="mb-0">{{ name }}</h2>
+    <span class="ms-auto small text-muted">Preferred platform: {{ pref_os }}/{{ pref_arch }}</span>
+  </div>
+
+  {% if tags|length == 0 %}
+    <div class="alert alert-info">This repository has no tags.</div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table align-middle">
+      <thead>
+        <tr>
+          <th scope="col">Tag</th>
+          <th scope="col">Digest</th>
+          <th scope="col" class="text-end">Size</th>
+          <th scope="col">Created</th>
+          <th scope="col">Pushed</th>
+          <th scope="col" class="text-end">Pulls</th>
+          {% if enable_delete %}<th scope="col" class="text-end">Actions</th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><span class="badge text-bg-light tag-pill">{{ row.tag }}</span></td>
+          <td class="digest">{{ row.digest_short }}</td>
+          <td class="text-end nowrap">{{ row.size_h }}</td>
+          <td class="nowrap">{{ row.created_h }}</td>
+          <td class="nowrap">{{ row.pushed_h }}</td>
+          <td class="text-end">{{ row.pulls_h }}</td>
+{% if enable_delete %}
+<td class="text-end">
+  <form method="post" action="{{ url_for('delete_tag', name=name) }}" onsubmit="return confirm('Delete tag {{ row.tag }}?');" class="d-inline">
+    <input type="hidden" name="tag" value="{{ row.tag }}">
+    {% if row.digest and row.digest.startswith('sha256:') %}
+      <input type="hidden" name="digest" value="{{ row.digest }}">
+    {% endif %}
+    {% if admin_token_required %}
+      <input type="hidden" name="token" value="{{ admin_token }}">
+    {% endif %}
+    <button class="btn btn-sm btn-outline-danger" type="submit">Delete tag</button>
+  </form>
+</td>
+{% endif %}
+
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,51 @@
+# --------------------------------------------------------------------
+# Setup (run once before `docker compose up -d`):
+#
+# mkdir -p ~/docker-registry/{data,auth}
+# cd ~/docker-registry
+#
+# # Create basic-auth user "admin" with password "Admin123" (change both!)
+# docker run --rm --entrypoint htpasswd httpd:2 -Bbn admin Admin123 > auth/htpasswd
+#
+# # Start services
+# docker compose up -d
+#
+# --------------------------------------------------------------------
+
+services:
+  registry:
+    image: registry:2
+    container_name: registry
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      REGISTRY_HTTP_SECRET: "CHANGE-ME-TO-A-LONG-RANDOM-STRING"
+      REGISTRY_HTTP_ADDR: 0.0.0.0:5000
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Registry Realm"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - ./data:/var/lib/registry
+      - ./auth:/auth
+      - ./config.yml:/etc/docker/registry/config.yml:ro
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    container_name: registry_ui
+    restart: unless-stopped
+    depends_on:
+      - registry
+    ports:
+      - "8080:80"
+    environment:
+      SINGLE_REGISTRY: "true"
+      REGISTRY_TITLE: "Raspberry Pi Registry"
+      REGISTRY_URL: "/"
+      NGINX_PROXY_PASS_URL: "http://registry:5000"
+      NGINX_PROXY_HEADER_Authorization: "Basic ${REGISTRY_AUTH_B64}"
+      DELETE_IMAGES: "true"
+      SHOW_CONTENT_DIGEST: "true"
+      SHOW_CATALOG_NB_TAGS: "true"

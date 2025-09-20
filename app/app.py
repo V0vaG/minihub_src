@@ -7,10 +7,11 @@ Docker Registry MiniHub — Flask UI (Docker Hub–style)
 - Supports delete tag/repo (opt-in).
 
 ENV (minimal):
-  REGISTRY_URL (required) e.g. http://192.168.68.64:8080
+  REGISTRY_URL (required) e.g. http://192.168.68.64:5000
   FLASK_SECRET (cookie signing; default: minihub-dev)
   ENABLE_DELETE=1 (enable delete endpoints)
   ADMIN_TOKEN=... (required when delete is enabled)
+  DELETE_WHEN_AUTH=1 (auto-enable delete for logged-in users; no ADMIN_TOKEN required)
   PULLS_DB=/path/to/pulls.json  (optional local JSON: {"repo:tag": 123})
 
 Notes:
@@ -40,20 +41,18 @@ from flask import (
 # -----------------------------
 # Config
 # -----------------------------
-
-# Set up paths
 alias = "minihub"
 HOME_DIR = os.path.expanduser("~")
 FILES_PATH = os.path.join(HOME_DIR, "script_files", alias)
 DATA_DIR = os.path.join(FILES_PATH, "data")
-
-# Ensure the directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
-
 
 version = os.getenv('VERSION', 'N/A')
 branch = os.getenv('BRANCH','N/A')
-REGISTRY_URL = os.getenv("REGISTRY_URL", "http://192.168.68.64:8080").rstrip('/')
+
+# IMPORTANT: default to talking directly to the registry (5000).
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://192.168.68.64:5000").rstrip('/')
+
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 CACHE_TTL = int(os.getenv("CACHE_TTL", "10"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
@@ -63,83 +62,21 @@ PAGE_SIZE = int(os.getenv("PAGE_SIZE", "50"))
 ENABLE_DELETE = os.getenv("ENABLE_DELETE", "1").lower() in ("1", "true", "yes", "on")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 PULLS_DB = os.getenv("PULLS_DB")
-
-H_MANIFEST_V2 = {"Accept": "application/vnd.docker.distribution.manifest.v2+json"}
-H_BOTH = {"Accept": ", ".join([
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-])}
-
-# -----------------------------
-# Simple in-memory cache
-# -----------------------------
-class TTLCache:
-    def __init__(self, ttl: int = 60):
-        self.ttl = ttl
-        self._store: Dict[str, Tuple[float, object]] = {}
-        self._lock = threading.Lock()
-
-    def get(self, key: str):
-        with self._lock:
-            item = self._store.get(key)
-            if not item:
-                return None
-            ts, val = item
-            if time.time() - ts > self.ttl:
-                self._store.pop(key, None)
-                return None
-            return val
-
-    def set(self, key: str, val):
-        with self._lock:
-            self._store[key] = (time.time(), val)
-
-# Auto-enable deletes when user is authenticated in the web UI
 DELETE_WHEN_AUTH = os.getenv("DELETE_WHEN_AUTH", "1").lower() in ("1", "true", "yes", "on")
 
-def is_logged_in() -> bool:
-    return bool(session.get("reg_user") and session.get("reg_pass"))
+# Media types
+MT_DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+MT_DOCKER_MAN  = "application/vnd.docker.distribution.manifest.v2+json"
+MT_OCI_INDEX   = "application/vnd.oci.image.index.v1+json"
+MT_OCI_MAN     = "application/vnd.oci.image.manifest.v1+json"
+MT_SCHEMA1     = "application/vnd.docker.distribution.manifest.v1+json"
+MT_SCHEMA1_PJ  = "application/vnd.docker.distribution.manifest.v1+prettyjws"
 
-def delete_enabled_now() -> bool:
-    # Enable if env says so, or if logged in and DELETE_WHEN_AUTH is on
-    return ENABLE_DELETE or (DELETE_WHEN_AUTH and is_logged_in())
-
-def token_required_now() -> bool:
-    # Only require ADMIN_TOKEN when using the old env-based gate
-    # If we’re enabling delete because the user is logged in, skip token
-    return ENABLE_DELETE and not (DELETE_WHEN_AUTH and is_logged_in())
-
-# Hide freshly-deleted repos from the UI immediately (even if registry/_catalog still lists them)
-TOMBSTONE_TTL = int(os.getenv("TOMBSTONE_TTL", "300"))  # seconds
-_repo_tombstones: Dict[str, float] = {}
-_repo_tomb_lock = threading.Lock()
-
-def _tombstone_cleanup():
-    now = time.time()
-    with _repo_tomb_lock:
-        for k in list(_repo_tombstones.keys()):
-            if _repo_tombstones[k] <= now:
-                _repo_tombstones.pop(k, None)
-
-def mark_repo_tombstoned(name: str):
-    with _repo_tomb_lock:
-        _repo_tombstones[name] = time.time() + TOMBSTONE_TTL
-
-def is_repo_tombstoned(name: str) -> bool:
-    _tombstone_cleanup()
-    with _repo_tomb_lock:
-        exp = _repo_tombstones.get(name)
-        if not exp:
-            return False
-        if exp <= time.time():
-            _repo_tombstones.pop(name, None)
-            return False
-        return True
-
-
+H_MANIFEST_V2 = {"Accept": MT_DOCKER_MAN}
+H_BOTH = {"Accept": ", ".join([MT_OCI_INDEX, MT_OCI_MAN, MT_DOCKER_LIST, MT_DOCKER_MAN])}
 
 # -----------------------------
-# Simple in-memory cache
+# Cache
 # -----------------------------
 class TTLCache:
     def __init__(self, ttl: int = 60):
@@ -148,7 +85,6 @@ class TTLCache:
         self._lock = threading.Lock()
 
     def get(self, key: str):
-        # ttl==0 disables caching
         if self.ttl <= 0:
             return None
         with self._lock:
@@ -177,54 +113,60 @@ class TTLCache:
                 if k.startswith(prefix):
                     self._store.pop(k, None)
 
-# instantiate AFTER the class
 cache = TTLCache(ttl=CACHE_TTL)
 
+# -----------------------------
+# Tombstones (hide deleted repos immediately)
+# -----------------------------
+TOMBSTONE_TTL = int(os.getenv("TOMBSTONE_TTL", "300"))  # seconds
+_repo_tombstones: Dict[str, float] = {}
+_repo_tomb_lock = threading.Lock()
+
+def _tombstone_cleanup():
+    now = time.time()
+    with _repo_tomb_lock:
+        for k in list(_repo_tombstones.keys()):
+            if _repo_tombstones[k] <= now:
+                _repo_tombstones.pop(k, None)
+
+def mark_repo_tombstoned(name: str):
+    with _repo_tomb_lock:
+        _repo_tombstones[name] = time.time() + TOMBSTONE_TTL
+
+def is_repo_tombstoned(name: str) -> bool:
+    _tombstone_cleanup()
+    with _repo_tomb_lock:
+        exp = _repo_tombstones.get(name)
+        if not exp:
+            return False
+        if exp <= time.time():
+            _repo_tombstones.pop(name, None)
+            return False
+        return True
 
 # -----------------------------
-# HTTP helpers (registry calls)
+# Helpers
 # -----------------------------
-
-def get_manifest_json_with_accept(repo: str, ref: str, accept: Optional[str]) -> Optional[dict]:
+def get_manifest_v2like(repo: str, ref: str) -> Tuple[Optional[dict], str, dict]:
     """
-    GET the manifest JSON using a specific Accept. Returns None on 404/406.
+    Try GET in order: OCI index, Docker list, OCI manifest, Docker manifest.
+    Returns (json or None, content_type, headers).
     """
-    try:
-        headers = {"Accept": accept} if accept else None
-        r = _get(f"/v2/{repo}/manifests/{ref}", headers=headers)
-        return r.json()
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code in (404, 406):
-            return None
-        raise
-
-
-def head_manifest(repo: str, ref: str):
-    """
-    Return (chosen_accept, content_type, headers) using HEAD.
-    Prefer manifest-list v2, then schema2 v2. Ignore schema1.
-    """
-    accepts = [
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    ]
-    for acc in accepts:
+    for acc in (MT_OCI_INDEX, MT_DOCKER_LIST, MT_OCI_MAN, MT_DOCKER_MAN):
         try:
-            r = _head(f"/v2/{repo}/manifests/{ref}", headers={"Accept": acc})
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            # Only accept if server actually returned v2/list or v2
-            if "manifest.list.v2+json" in ctype or "manifest.v2+json" in ctype:
-                return acc, ctype, r.headers
+            r = _get(f"/v2/{repo}/manifests/{ref}", headers={"Accept": acc})
+            return r.json(), (r.headers.get("Content-Type") or "").lower(), r.headers
         except requests.HTTPError as e:
-            if not (e.response is not None and e.response.status_code in (404, 406)):
-                raise
-    # Last resort: do a plain HEAD (may be schema1; not ideal)
-    try:
-        r = _head(f"/v2/{repo}/manifests/{ref}")
-        return None, (r.headers.get("Content-Type") or "").lower(), r.headers
-    except requests.HTTPError:
-        return None, "", {}
+            # Try next on 404/406; re-raise other HTTP errors
+            if getattr(e.response, "status_code", None) in (404, 406):
+                continue
+            raise
+    return None, "", {}
 
+
+
+def _url(path: str) -> str:
+    return f"{REGISTRY_URL}{path}"
 
 def _clean_ref(x):
     if x is None:
@@ -234,16 +176,16 @@ def _clean_ref(x):
         return None
     return v
 
+def is_logged_in() -> bool:
+    return bool(session.get("reg_user") and session.get("reg_pass"))
 
+def delete_enabled_now() -> bool:
+    return ENABLE_DELETE or (DELETE_WHEN_AUTH and is_logged_in())
 
-def _url(path: str) -> str:
-    return f"{REGISTRY_URL}{path}"
+def token_required_now() -> bool:
+    return ENABLE_DELETE and not (DELETE_WHEN_AUTH and is_logged_in())
 
 def _build_requests_session() -> requests.Session:
-    """
-    Build a per-request session using creds from Flask session,
-    falling back to REGISTRY_USER/REGISTRY_PASS env vars if present.
-    """
     s = requests.Session()
     u = session.get("reg_user") or os.getenv("REGISTRY_USER")
     p = session.get("reg_pass") or os.getenv("REGISTRY_PASS")
@@ -252,7 +194,6 @@ def _build_requests_session() -> requests.Session:
     return s
 
 class AuthRequired(Exception):
-    """Raised when the registry returns 401 so we can redirect to /login."""
     pass
 
 def _get(path: str, headers: Optional[Dict[str, str]] = None) -> requests.Response:
@@ -263,8 +204,272 @@ def _get(path: str, headers: Optional[Dict[str, str]] = None) -> requests.Respon
     r.raise_for_status()
     return r
 
+def _head(path: str, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    s = _build_requests_session()
+    r = s.head(_url(path), headers=headers or {}, timeout=REQUEST_TIMEOUT)
+    if r.status_code == 401:
+        raise AuthRequired()
+    r.raise_for_status()
+    return r
+
 # -----------------------------
-# Registry ops (repos/tags/info)
+# Manifest helpers
+# -----------------------------
+def get_manifest_json_with_accept(repo: str, ref: str, accept: Optional[str]) -> Optional[dict]:
+    try:
+        headers = {"Accept": accept} if accept else None
+        r = _get(f"/v2/{repo}/manifests/{ref}", headers=headers)
+        return r.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (404, 406):
+            return None
+        raise
+
+def head_manifest(repo: str, ref: str):
+    """Try HEAD for metadata, but never fail hard."""
+    accepts = [MT_OCI_INDEX, MT_OCI_MAN, MT_DOCKER_LIST, MT_DOCKER_MAN]
+    for acc in accepts:
+        try:
+            r = _head(f"/v2/{repo}/manifests/{ref}", headers={"Accept": acc})
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if any(t in ctype for t in (MT_OCI_INDEX, MT_OCI_MAN, MT_DOCKER_LIST, MT_DOCKER_MAN)):
+                return acc, ctype, r.headers
+        except requests.HTTPError as e:
+            # Treat 404/406/405 as “try next”, anything else re-raise
+            sc = getattr(e.response, "status_code", None)
+            if sc not in (404, 406, 405):
+                raise
+        except requests.RequestException:
+            # Network/timeout etc — just give up on HEAD
+            break
+    return None, "", {}
+
+def _fetch_single_manifest(repo: str, digest_or_ref: str) -> Optional[dict]:
+    """Fetch a single (non-list/index) manifest trying OCI then Docker v2."""
+    for acc in (MT_OCI_MAN, MT_DOCKER_MAN):
+        doc = get_manifest_json_with_accept(repo, digest_or_ref, acc)
+        if doc is not None:
+            return doc
+    return None
+
+def _sum_layer_sizes(manifest_json: dict) -> Optional[int]:
+    layers = manifest_json.get("layers")
+    if not layers:
+        return None
+    total = 0
+    for l in layers:
+        sz = l.get("size")
+        if isinstance(sz, int):
+            total += sz
+        else:
+            return None
+    return total
+
+def _choose_manifest_from_list(repo: str, manifest_list: dict) -> Optional[dict]:
+    """Pick a child manifest from an OCI index or Docker manifest list and return its JSON."""
+    manifests = manifest_list.get("manifests") or []
+    os_pref, arch_pref = PREFERRED_PLATFORM
+
+    chosen = None
+    for m in manifests:
+        plat = m.get("platform", {})
+        if plat.get("os") == os_pref and plat.get("architecture") == arch_pref:
+            chosen = m
+            break
+    if not chosen:
+        for m in manifests:
+            if m.get("platform", {}).get("os") == "linux":
+                chosen = m
+                break
+    if not chosen and manifests:
+        chosen = manifests[0]
+    if not chosen:
+        return None
+
+    digest = chosen.get("digest")
+    if not digest:
+        return None
+
+    # Fetch the actual child manifest (try OCI then Docker v2)
+    return _fetch_single_manifest(repo, digest)
+
+def _get_config_json(repo: str, manifest_json: dict) -> Optional[dict]:
+    cfg = manifest_json.get("config") or {}
+    digest = cfg.get("digest")
+    if not digest:
+        return None
+    r = _get(f"/v2/{repo}/blobs/{digest}")
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+def _get_manifest_v1(repo: str, ref: str) -> Optional[dict]:
+    for acc in (MT_SCHEMA1, MT_SCHEMA1_PJ):
+        try:
+            r = _get(f"/v2/{repo}/manifests/{ref}", headers={"Accept": acc})
+            return r.json()
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (404, 406):
+                continue
+            raise
+        except Exception:
+            continue
+    return None
+
+def _estimate_size_from_v1(repo: str, v1doc: dict) -> Optional[int]:
+    layers = v1doc.get("fsLayers") or []
+    digests = [l.get("blobSum") for l in layers if l.get("blobSum")]
+    seen = set()
+    uniq = []
+    for d in digests:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    total = 0
+    s = _build_requests_session()
+    for dg in uniq:
+        try:
+            r = s.head(_url(f"/v2/{repo}/blobs/{dg}"), timeout=REQUEST_TIMEOUT)
+            if r.status_code == 401:
+                raise AuthRequired()
+            r.raise_for_status()
+            cl = r.headers.get("Content-Length")
+            if cl:
+                total += int(cl)
+        except Exception:
+            pass
+    return total or None
+
+def _extract_created_platform_from_v1(v1doc: dict) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        hist = v1doc.get("history") or []
+        if not hist:
+            return None, None
+        v1c = hist[0].get("v1Compatibility")
+        if not v1c:
+            return None, None
+        data = json.loads(v1c)
+        created = data.get("created")
+        osv = data.get("os")
+        arch = data.get("architecture")
+        platform = "/".join([v for v in (osv, arch) if v]) if (osv or arch) else None
+        return created, platform
+    except Exception:
+        return None, None
+
+def fmt_size(bytes_val: Optional[int]) -> str:
+    if bytes_val is None:
+        return "—"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(bytes_val)
+    idx = 0
+    while size >= 1024.0 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    return f"{int(size)} {units[idx]}" if idx == 0 else f"{size:.2f} {units[idx]}"
+
+def fmt_dt(dt_str: Optional[str]) -> str:
+    if not dt_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+        return dt.strftime('%Y-%m-%d %H:%M:%S %z')
+    except Exception:
+        return dt_str
+
+def get_pulls(repo: str, tag: str) -> Optional[int]:
+    if not PULLS_DB:
+        return None
+    try:
+        ck = f"pullsdb:{PULLS_DB}"
+        data = cache.get(ck)
+        if data is None:
+            with open(PULLS_DB, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            cache.set(ck, data)
+        key = f"{repo}:{tag}"
+        return int(data.get(key)) if key in data else None
+    except Exception:
+        return None
+
+# -----------------------------
+# High-level: tag info
+# -----------------------------
+def get_tag_info(repo: str, tag: str) -> dict:
+    info = {
+        "tag": tag,
+        "digest": None,
+        "size_bytes": None,
+        "created": None,
+        "pushed": None,
+        "platform": None,
+        "pulls": get_pulls(repo, tag),
+    }
+
+    # Prefer GET (some proxies mishandle HEAD); still try HEAD later for extra hints.
+    doc, ctype, hdrs = get_manifest_v2like(repo, tag)
+
+    # If GET found something, take digest/pushed from those headers.
+    if hdrs:
+        dcd = (hdrs.get("Docker-Content-Digest") or "").strip()
+        if dcd.startswith("sha256:"):
+            info["digest"] = dcd
+        lm = hdrs.get("Last-Modified")
+        if lm:
+            info["pushed"] = lm
+
+    # Optional: try a HEAD for pushed/digest if still missing, but ignore failures.
+    if not info["digest"] or not info["pushed"]:
+        try:
+            _, _, hh = head_manifest(repo, tag)
+            if hh:
+                dcd = (hh.get("Docker-Content-Digest") or "").strip()
+                if dcd.startswith("sha256:"):
+                    info["digest"] = info["digest"] or dcd
+                lm = hh.get("Last-Modified")
+                if lm:
+                    info["pushed"] = info["pushed"] or lm
+        except Exception:
+            pass
+
+    # Parse the manifest we fetched
+    if doc is not None:
+        if MT_OCI_INDEX in ctype or MT_DOCKER_LIST in ctype:
+            # Multi-platform index/list: pick best child, then fetch that child manifest
+            chosen = _choose_manifest_from_list(repo, doc)
+            if chosen:
+                info["size_bytes"] = _sum_layer_sizes(chosen)
+                cfg = _get_config_json(repo, chosen)
+                if cfg:
+                    info["created"] = cfg.get("created")
+                    osv = cfg.get("os"); arch = cfg.get("architecture")
+                    info["platform"] = "/".join([v for v in (osv, arch) if v])
+            return info
+
+        if MT_DOCKER_MAN in ctype or MT_OCI_MAN in ctype:
+            info["size_bytes"] = _sum_layer_sizes(doc)
+            cfg = _get_config_json(repo, doc)
+            if cfg:
+                info["created"] = cfg.get("created")
+                osv = cfg.get("os"); arch = cfg.get("architecture")
+                info["platform"] = "/".join([v for v in (osv, arch) if v])
+            return info
+
+    # Schema1 fallback
+    v1 = _get_manifest_v1(repo, tag)
+    if v1:
+        info["size_bytes"] = _estimate_size_from_v1(repo, v1)
+        created, platform = _extract_created_platform_from_v1(v1)
+        if created:
+            info["created"] = created
+        if platform:
+            info["platform"] = platform
+
+    return info
+
+# -----------------------------
+# Registry listing
 # -----------------------------
 def list_repositories() -> List[str]:
     ck = "repos:list"
@@ -310,236 +515,18 @@ def list_tags(repo: str) -> List[str]:
     cache.set(ck, tags)
     return tags
 
-def _sum_layer_sizes(manifest_json: dict) -> Optional[int]:
-    layers = manifest_json.get("layers")
-    if not layers:
-        return None
-    total = 0
-    for l in layers:
-        sz = l.get("size")
-        if isinstance(sz, int):
-            total += sz
-        else:
-            return None
-    return total
-
-def _choose_manifest_from_list(repo: str, manifest_list: dict) -> Optional[dict]:
-    manifests = manifest_list.get("manifests") or []
-    os_pref, arch_pref = PREFERRED_PLATFORM
-
-    chosen = None
-    for m in manifests:
-        plat = m.get("platform", {})
-        if plat.get("os") == os_pref and plat.get("architecture") == arch_pref:
-            chosen = m
-            break
-    if not chosen:
-        for m in manifests:
-            if m.get("platform", {}).get("os") == "linux":
-                chosen = m
-                break
-    if not chosen and manifests:
-        chosen = manifests[0]
-
-    if not chosen:
-        return None
-
-    digest = chosen.get("digest")
-    if not digest:
-        return None
-
-    r = _get(f"/v2/{repo}/manifests/{digest}", headers=H_MANIFEST_V2)
-    return r.json()
-
-def _get_manifest(repo: str, ref: str):
-    r = _get(f"/v2/{repo}/manifests/{ref}", headers=H_BOTH)
-    media_type = r.headers.get("Content-Type", "")
-    return r.json(), r.headers, media_type
-
-def _get_config_json(repo: str, manifest_json: dict) -> Optional[dict]:
-    cfg = manifest_json.get("config") or {}
-    digest = cfg.get("digest")
-    if not digest:
-        return None
-    r = _get(f"/v2/{repo}/blobs/{digest}")
-    try:
-        return r.json()
-    except Exception:
-        return None
-
-def fmt_size(bytes_val: Optional[int]) -> str:
-    if bytes_val is None:
-        return "—"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(bytes_val)
-    idx = 0
-    while size >= 1024.0 and idx < len(units) - 1:
-        size /= 1024.0
-        idx += 1
-    return f"{int(size)} {units[idx]}" if idx == 0 else f"{size:.2f} {units[idx]}"
-
-def fmt_dt(dt_str: Optional[str]) -> str:
-    if not dt_str:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        return dt.strftime('%Y-%m-%d %H:%M:%S %z')
-    except Exception:
-        return dt_str
-
-def get_pulls(repo: str, tag: str) -> Optional[int]:
-    if not PULLS_DB:
-        return None
-    try:
-        ck = f"pullsdb:{PULLS_DB}"
-        data = cache.get(ck)
-        if data is None:
-            with open(PULLS_DB, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            cache.set(ck, data)
-        key = f"{repo}:{tag}"
-        return int(data.get(key)) if key in data else None
-    except Exception:
-        return None
-
-def get_tag_info(repo: str, tag: str) -> dict:
-    info = {
-        "tag": tag,
-        "digest": None,
-        "size_bytes": None,
-        "created": None,
-        "pushed": None,
-        "platform": None,
-        "pulls": get_pulls(repo, tag),
-    }
-
-    # 1) HEAD first to get a trustworthy digest + media type (v2/list > v2)
-    accept, ctype, hdrs = head_manifest(repo, tag)
-    if hdrs:
-        dcd = (hdrs.get("Docker-Content-Digest") or "").strip()
-        if dcd.startswith("sha256:"):
-            info["digest"] = dcd
-        lm = hdrs.get("Last-Modified")
-        if lm:
-            info["pushed"] = lm
-
-    # 2) Fetch manifest JSON with the chosen Accept so we have layers/config
-    doc = None
-    if accept:
-        doc = get_manifest_json_with_accept(repo, tag, accept)
-
-    # If the server refused v2/list & v2 and forced schema1 on plain HEAD,
-    # make one more attempt to GET schema2 anyway.
-    if doc is None and ("manifest.v2+json" not in ctype and "manifest.list.v2+json" not in ctype):
-        doc = get_manifest_json_with_accept(
-            repo, tag, "application/vnd.docker.distribution.manifest.v2+json"
-        )
-        if doc is not None:
-            ctype = "application/vnd.docker.distribution.manifest.v2+json"
-
-    # 3) Extract fields
-    if doc is None:
-        # Could not read a v2 manifest; leave fields as — (schema1 path)
-        return info
-
-    if "manifest.list.v2+json" in ctype:
-        # We have a manifest list; choose the best child and read its schema2
-        chosen = _choose_manifest_from_list(repo, doc)
-        if chosen:
-            info["size_bytes"] = _sum_layer_sizes(chosen)
-            cfg = _get_config_json(repo, chosen)
-            if cfg:
-                info["created"] = cfg.get("created")
-                osv = cfg.get("os"); arch = cfg.get("architecture")
-                info["platform"] = "/".join([v for v in (osv, arch) if v])
-        return info
-
-    if "manifest.v2+json" in ctype:
-        info["size_bytes"] = _sum_layer_sizes(doc)
-        cfg = _get_config_json(repo, doc)
-        if cfg:
-            info["created"] = cfg.get("created")
-            osv = cfg.get("os"); arch = cfg.get("architecture")
-            info["platform"] = "/".join([v for v in (osv, arch) if v])
-        return info
-
-    # Schema1 fallback (prettyjws) — no layers/config we can use
-    return info
-
-
-
-def _head(path: str, headers: Optional[Dict[str, str]] = None) -> requests.Response:
-    s = _build_requests_session()
-    r = s.head(_url(path), headers=headers or {}, timeout=REQUEST_TIMEOUT)
-    if r.status_code == 401:
-        raise AuthRequired()
-    r.raise_for_status()
-    return r
-
-def resolve_manifest_digest(repo: str, ref: str) -> Optional[str]:
-    """
-    Return the digest that the registry expects for DELETE.
-    Prefer top-level manifest-list, then schema2. Ignore schema1 rewrites.
-    """
-    if isinstance(ref, str) and ref.startswith("sha256:") and len(ref) > 20:
-        return ref
-
-    def _try(head_accept: Optional[str]) -> Optional[str]:
-        headers = {"Accept": head_accept} if head_accept else None
-        r = _head(f"/v2/{repo}/manifests/{ref}", headers=headers)
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        dcd = (r.headers.get("Docker-Content-Digest") or "").strip()
-        # Only trust digest if server returned a manifest-list or schema2
-        if ("manifest.list.v2+json" in ctype) or ("manifest.v2+json" in ctype):
-            return dcd if dcd.startswith("sha256:") else None
-        # If schema1 prettyjws, DO NOT use its digest; treat as miss
-        return None
-
-    # Try in order: manifest-list, schema2, and (as last resort) GET schema2
-    for accept in (
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    ):
-        try:
-            digest = _try(accept)
-            if digest:
-                return digest
-        except requests.HTTPError as e:
-            if not (e.response is not None and e.response.status_code in (404, 406)):
-                raise
-        except AuthRequired:
-            raise
-
-    # Last resort: force a GET with schema2 Accept and read its headers
-    try:
-        r = _get(f"/v2/{repo}/manifests/{ref}",
-                 headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"})
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        dcd = (r.headers.get("Docker-Content-Digest") or "").strip()
-        if "manifest.v2+json" in ctype and dcd.startswith("sha256:"):
-            return dcd
-    except requests.HTTPError as e:
-        if not (e.response is not None and e.response.status_code in (404, 406)):
-            raise
-    except AuthRequired:
-        raise
-
-    return None
-
-
 # -----------------------------
-# Flask app + Routes
+# Flask app
 # -----------------------------
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "minihub-dev")
+
 @app.after_request
 def add_no_cache_headers(resp):
-    # Make HTML responses always revalidate
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0, private"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
-
 
 # ---- Auth pages (HTML login) ----
 @app.route("/login", methods=["GET", "POST"])
@@ -548,7 +535,6 @@ def login():
     if request.method == "POST":
         session["reg_user"] = (request.form.get("username") or "").strip() or None
         session["reg_pass"] = request.form.get("password") or None
-        # Optional: quick probe to validate creds
         try:
             _ = _get("/v2/_catalog?n=1")
             flash("Logged in.", "success")
@@ -556,7 +542,6 @@ def login():
         except AuthRequired:
             flash("Unauthorized — check username/password.", "danger")
         except Exception:
-            # ignore non-401 errors (may be anonymous registry)
             return redirect(next_url)
     return render_template("login.html", next=next_url)
 
@@ -612,7 +597,6 @@ def home():
         admin_token=ADMIN_TOKEN if token_required_now() else None,
         version=version, branch=branch,
     )
-
 
 @app.route("/r/<path:name>")
 def repo_detail(name: str):
@@ -670,6 +654,7 @@ def repo_detail(name: str):
         enable_delete=delete_enabled_now(),
         admin_token_required=token_required_now(),
         admin_token=ADMIN_TOKEN if token_required_now() else None,
+        version=version, branch=branch,
     )
 
 @app.get("/healthz")
@@ -680,6 +665,7 @@ def healthz():
 def _require_delete_enabled():
     if not delete_enabled_now():
         abort(403, description="Delete disabled. Log in or set ENABLE_DELETE=1.")
+
 def _check_token_if_required(form):
     if token_required_now():
         tok = form.get('token')
@@ -693,11 +679,9 @@ def delete_tag(name: str):
 
     tag = _clean_ref(request.form.get('tag'))
     digest_in = _clean_ref(request.form.get('digest'))
-
     if not tag:
         abort(400, description="Missing tag")
 
-    # If form digest isn’t a real sha256, resolve from the tag
     ref = digest_in if (digest_in and digest_in.startswith("sha256:")) else tag
     digest = resolve_manifest_digest(name, ref)
     if not digest:
@@ -705,7 +689,7 @@ def delete_tag(name: str):
 
     try:
         s = _build_requests_session()
-        r = s.delete(_url(f"/v2/{name}/manifests/{digest}"), timeout=REQUEST_TIMEOUT)  # no Accept on DELETE
+        r = s.delete(_url(f"/v2/{name}/manifests/{digest}"), timeout=REQUEST_TIMEOUT)
         if r.status_code in (202, 200):
             flash(f"Deleted tag '{tag}' (manifest {digest[:20]}…)", "success")
         else:
@@ -713,10 +697,49 @@ def delete_tag(name: str):
     except Exception as e:
         flash(f"Delete failed: {e}", "danger")
     finally:
-        cache.delete(f"tags:{name}")  # refresh tag list immediately
+        cache.delete(f"tags:{name}")
 
     return redirect(url_for('repo_detail', name=name, _=int(time.time())))
 
+def resolve_manifest_digest(repo: str, ref: str) -> Optional[str]:
+    """Return the digest expected for DELETE. Prefer index/list, then schema2."""
+    if isinstance(ref, str) and ref.startswith("sha256:") and len(ref) > 20:
+        return ref
+
+    def _try(head_accept: Optional[str]) -> Optional[str]:
+        headers = {"Accept": head_accept} if head_accept else None
+        r = _head(f"/v2/{repo}/manifests/{ref}", headers=headers)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        dcd = (r.headers.get("Docker-Content-Digest") or "").strip()
+        if (MT_DOCKER_LIST in ctype) or (MT_DOCKER_MAN in ctype) or (MT_OCI_INDEX in ctype) or (MT_OCI_MAN in ctype):
+            return dcd if dcd.startswith("sha256:") else None
+        return None
+
+    for accept in (MT_OCI_INDEX, MT_DOCKER_LIST, MT_OCI_MAN, MT_DOCKER_MAN):
+        try:
+            digest = _try(accept)
+            if digest:
+                return digest
+        except requests.HTTPError as e:
+            if not (e.response is not None and e.response.status_code in (404, 406)):
+                raise
+        except AuthRequired:
+            raise
+
+    # Last resort: GET schema2
+    try:
+        r = _get(f"/v2/{repo}/manifests/{ref}", headers={"Accept": MT_DOCKER_MAN})
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        dcd = (r.headers.get("Docker-Content-Digest") or "").strip()
+        if MT_DOCKER_MAN in ctype and dcd.startswith("sha256:"):
+            return dcd
+    except requests.HTTPError as e:
+        if not (e.response is not None and e.response.status_code in (404, 406)):
+            raise
+    except AuthRequired:
+        raise
+
+    return None
 
 @app.post("/r/<path:name>/delete_repo")
 def delete_repo(name: str):
@@ -741,10 +764,8 @@ def delete_repo(name: str):
         except Exception:
             errors += 1
 
-    # Refresh caches so the next view reflects the change
     cache.delete(f"tags:{name}")
     cache.delete("repos:list")
-
     if errors == 0:
         mark_repo_tombstoned(name)
 
@@ -753,6 +774,8 @@ def delete_repo(name: str):
           "success" if errors == 0 else "warning")
     return redirect(url_for('home', _=int(time.time())))
 
-
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG", "0") == "1")

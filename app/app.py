@@ -538,6 +538,7 @@ def home():
         enable_delete=delete_enabled_now(),
         admin_token_required=token_required_now(),
         admin_token=ADMIN_TOKEN if token_required_now() else None,
+        version=version, branch=branch,
     )
 
 

@@ -33,3 +33,41 @@ pip install -r requirements.txt
 export REGISTRY_URL="http://192.168.68.64:8080"
 FLASK_APP=app.py flask run -h 0.0.0.0 -p 5000
 ```
+
+
+
+
+@@ make argocd pull from privet castum repo
+
+
+containers:
+- name: minihub
+image: 192.168.68.64:5000/minihub:amd64_latest
+
+kubectl create secret docker-registry regcred \
+  --docker-server=192.168.68.64:5000 \
+  --docker-username=admin \
+  --docker-password='Admin123' \
+  --docker-email='its_a_vio@hotmail.com' \
+  -n argocd
+
+sudo mkdir -p /etc/rancher/k3s
+
+sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<'EOF'
+mirrors:
+  "192.168.68.64:5000":
+    endpoint:
+      - "http://192.168.68.64:5000"
+
+# If your registry requires auth, uncomment and fill:
+#configs:
+#  "192.168.68.64:5000":
+#    auth:
+#      username: admin
+#      password: Admin123
+#    # Only for self-signed HTTPS (NOT needed for plain HTTP):
+#    #tls:
+#    #  insecure_skip_verify: true
+EOF
+
+sudo systemctl restart k3s

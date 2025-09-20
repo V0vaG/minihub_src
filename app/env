@@ -1,5 +1,5 @@
 VOLUMES="['/home/$USER/script_files/${proejct}:/root/script_files/${proejct}']"
-VERSION='0.0.5'
+VERSION='0.0.6'
 # B_NUM='1'
 ARGS="--build-arg VERSION=$VERSION --build-arg B_NUM=$B_NUM --build-arg BRANCH=${BRANCH} --build-arg IP=192.168.68.67:30091"
 COMMAND='gunicorn -w 4 -b 0.0.0.0:5000 wsgi:app'

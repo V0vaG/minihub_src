@@ -184,6 +184,48 @@ cache = TTLCache(ttl=CACHE_TTL)
 # -----------------------------
 # HTTP helpers (registry calls)
 # -----------------------------
+
+def get_manifest_json_with_accept(repo: str, ref: str, accept: Optional[str]) -> Optional[dict]:
+    """
+    GET the manifest JSON using a specific Accept. Returns None on 404/406.
+    """
+    try:
+        headers = {"Accept": accept} if accept else None
+        r = _get(f"/v2/{repo}/manifests/{ref}", headers=headers)
+        return r.json()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (404, 406):
+            return None
+        raise
+
+
+def head_manifest(repo: str, ref: str):
+    """
+    Return (chosen_accept, content_type, headers) using HEAD.
+    Prefer manifest-list v2, then schema2 v2. Ignore schema1.
+    """
+    accepts = [
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ]
+    for acc in accepts:
+        try:
+            r = _head(f"/v2/{repo}/manifests/{ref}", headers={"Accept": acc})
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            # Only accept if server actually returned v2/list or v2
+            if "manifest.list.v2+json" in ctype or "manifest.v2+json" in ctype:
+                return acc, ctype, r.headers
+        except requests.HTTPError as e:
+            if not (e.response is not None and e.response.status_code in (404, 406)):
+                raise
+    # Last resort: do a plain HEAD (may be schema1; not ideal)
+    try:
+        r = _head(f"/v2/{repo}/manifests/{ref}")
+        return None, (r.headers.get("Content-Type") or "").lower(), r.headers
+    except requests.HTTPError:
+        return None, "", {}
+
+
 def _clean_ref(x):
     if x is None:
         return None
@@ -371,11 +413,37 @@ def get_tag_info(repo: str, tag: str) -> dict:
         "pulls": get_pulls(repo, tag),
     }
 
-    doc, headers, media_type = _get_manifest(repo, tag)
-    info["digest"] = headers.get("Docker-Content-Digest")
-    info["pushed"] = headers.get("Last-Modified") or None
+    # 1) HEAD first to get a trustworthy digest + media type (v2/list > v2)
+    accept, ctype, hdrs = head_manifest(repo, tag)
+    if hdrs:
+        dcd = (hdrs.get("Docker-Content-Digest") or "").strip()
+        if dcd.startswith("sha256:"):
+            info["digest"] = dcd
+        lm = hdrs.get("Last-Modified")
+        if lm:
+            info["pushed"] = lm
 
-    if "manifest.list.v2+json" in media_type:
+    # 2) Fetch manifest JSON with the chosen Accept so we have layers/config
+    doc = None
+    if accept:
+        doc = get_manifest_json_with_accept(repo, tag, accept)
+
+    # If the server refused v2/list & v2 and forced schema1 on plain HEAD,
+    # make one more attempt to GET schema2 anyway.
+    if doc is None and ("manifest.v2+json" not in ctype and "manifest.list.v2+json" not in ctype):
+        doc = get_manifest_json_with_accept(
+            repo, tag, "application/vnd.docker.distribution.manifest.v2+json"
+        )
+        if doc is not None:
+            ctype = "application/vnd.docker.distribution.manifest.v2+json"
+
+    # 3) Extract fields
+    if doc is None:
+        # Could not read a v2 manifest; leave fields as — (schema1 path)
+        return info
+
+    if "manifest.list.v2+json" in ctype:
+        # We have a manifest list; choose the best child and read its schema2
         chosen = _choose_manifest_from_list(repo, doc)
         if chosen:
             info["size_bytes"] = _sum_layer_sizes(chosen)
@@ -384,14 +452,18 @@ def get_tag_info(repo: str, tag: str) -> dict:
                 info["created"] = cfg.get("created")
                 osv = cfg.get("os"); arch = cfg.get("architecture")
                 info["platform"] = "/".join([v for v in (osv, arch) if v])
-    elif "manifest.v2+json" in media_type:
+        return info
+
+    if "manifest.v2+json" in ctype:
         info["size_bytes"] = _sum_layer_sizes(doc)
         cfg = _get_config_json(repo, doc)
         if cfg:
             info["created"] = cfg.get("created")
             osv = cfg.get("os"); arch = cfg.get("architecture")
             info["platform"] = "/".join([v for v in (osv, arch) if v])
+        return info
 
+    # Schema1 fallback (prettyjws) — no layers/config we can use
     return info
 
 
